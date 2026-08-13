@@ -1,0 +1,26 @@
+--- a/mcore_bridge/config/model_config.py
++++ b/mcore_bridge/config/model_config.py
+@@ -288,6 +288,23 @@
+         from mcore_bridge.model import get_mcore_model_type, get_model_meta
+         self._augment_mindspeed_defaults()
+         self._format_config()
++        # DeepSeek-V4's DSpark blocks are speculative-decoding modules, not the
++        # generic Megatron MTP architecture.  In particular, their checkpoint
++        # contains main_proj/main_norm rather than enorm/hnorm/e_proj/h_proj.
++        # Do not construct a generic MTP layer for DSpark checkpoints: it would
++        # either fail to load or, worse, train randomly initialized MTP weights.
++        if (getattr(self.hf_config, 'model_type', None) == 'deepseek_v4'
++                and getattr(self.hf_config, 'dspark_block_size', None) is not None
++                and self.mtp_num_layers):
++            logger.warning(
++                'DeepSeek-V4 DSpark MTP is not supported by the generic Megatron MTP implementation; '
++                'disabling MTP for training. DSpark speculative-decoding weights will not be loaded or trained.')
++            self.mtp_num_layers = None
++            if self.pipeline_model_parallel_layout is not None:
++                # ``m`` is Megatron's generic-MTP layer marker.  Keeping it
++                # after MTP is disabled makes the pipeline-layout validator
++                # require a nonexistent MTP layer.
++                self.pipeline_model_parallel_layout = str(self.pipeline_model_parallel_layout).replace('m', '')
+         if self.experimental_attention_variant is not None:
+             require_version('megatron-core>=0.16.0.dev',
+                             'experimental attention variant requires megatron-core>=0.16.0')

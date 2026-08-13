@@ -1,0 +1,26 @@
+--- a/swift/megatron/model/utils.py
++++ b/swift/megatron/model/utils.py
+@@ -35,6 +35,23 @@
+
+
+ def get_mcore_model_config(args, hf_config):
++    # DSpark is DeepSeek-V4's speculative-decoding architecture. It is not
++    # compatible with mcore_bridge's generic MTP module, whose checkpoint key
++    # layout expects enorm/hnorm/e_proj/h_proj. Clear the CLI setting here as
++    # well, so trainer bookkeeping does not report generic-MTP losses that the
++    # constructed model cannot produce.
++    if (getattr(hf_config, 'model_type', None) == 'deepseek_v4'
++            and getattr(hf_config, 'dspark_block_size', None) is not None
++            and getattr(args, 'mtp_num_layers', None)):
++        logger.warning(
++            'Ignoring --mtp_num_layers for DeepSeek-V4 DSpark: generic MTP training is unsupported. '
++            'The DSpark speculative-decoding weights will not be loaded or trained.')
++        args.mtp_num_layers = None
++        if getattr(args, 'pipeline_model_parallel_layout', None) is not None:
++            # ``m`` denotes a generic Megatron MTP layer in the pipeline
++            # layout. Remove it together with the incompatible MTP setting.
++            args.pipeline_model_parallel_layout = args.pipeline_model_parallel_layout.replace('m', '')
++
+     kwargs = hf_to_mcore_config(hf_config)
+     kwargs['mcore_model_type'] = args.megatron_model_meta.model_type
+     kwargs['hf_config'] = hf_config

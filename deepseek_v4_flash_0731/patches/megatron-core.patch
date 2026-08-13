@@ -1,0 +1,101 @@
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -446,6 +446,12 @@
+                         else:
+                             shard_main_param = shard_model_param.clone().float()
+
++                        # Optimizers require leaf tensors. The sharded BF16 view
++                        # can require gradients, making clone().float() non-leaf
++                        # under recent PyTorch. Detaching here matches the
++                        # Float16Optimizer master-parameter construction.
++                        shard_main_param = shard_main_param.detach()
++
+                         tensor_parallel.copy_tensor_model_parallel_attributes(
+                             shard_main_param, model_param
+                         )
+@@ -465,7 +471,11 @@
+
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
++                    # The optimizer updates this shard in place, so preserve the
++                    # storage view while making it a leaf tensor for PyTorch.
++                    shard_model_param = model_param.detach().view(-1)[
++                        param_range.start : param_range.end
++                    ]
+                     model_fp32_params_this_group.append(model_param)
+                     shard_fp32_params_this_group.append(shard_model_param)
+                     tensor_parallel.copy_tensor_model_parallel_attributes(
+--- a/megatron/core/transformer/experimental_attention_variant/csa.py
++++ b/megatron/core/transformer/experimental_attention_variant/csa.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+ import copy
++import os
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from typing import Optional, Tuple, Union
+@@ -592,29 +593,42 @@
+     # ----------- Shared core: gather, MQA softmax with sink, sum ---------
+     rows, np_, hn = q_flat.shape
+
+-    safe_indices = global_indices.clamp(min=0).long()
+-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
+-    kv_gathered = torch.gather(
+-        kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=safe_indices_exp
+-    )  # (rows, topk, hn)
+-
+-    q_f = q_flat.float()
+-    kv_g = kv_gathered.float()
+-    scores = torch.einsum("inh,ikh->ink", q_f, kv_g) * softmax_scale  # (rows, np, topk)
+-
+-    invalid_mask = (global_indices < 0).unsqueeze(1)  # (rows, 1, topk)
+-    scores = scores.masked_fill(invalid_mask, float("-inf"))
++    # At 64K context, materializing (rows, topk, head_dim) for every row can
++    # exceed H100 memory before the checkpointed activation is released. The
++    # reference implementation is otherwise separable across rows, so bound
++    # its temporary gather/FP32 workspace without changing its math.
++    chunk_rows = int(os.environ.get("MEGATRON_DSV4_UNFUSED_ATTN_CHUNK_ROWS", "256"))
++    if chunk_rows <= 0:
++        chunk_rows = rows
+
+     sink = attn_sink.view(1, np_, 1).float()
+-    scores_max = scores.max(dim=-1, keepdim=True).values
+-    scores_max = torch.max(scores_max, sink)
+-
+-    exp_scores = torch.exp(scores - scores_max)
+-    exp_sink = torch.exp(sink - scores_max)
+-    attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
++    output_chunks = []
++    for start in range(0, rows, chunk_rows):
++        end = min(start + chunk_rows, rows)
++        q_chunk = q_flat[start:end]
++        indices_chunk = global_indices[start:end]
++        safe_indices = indices_chunk.clamp(min=0).long()
++        safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
++        kv_gathered = torch.gather(
++            kv_flat.unsqueeze(0).expand(end - start, -1, -1),
++            dim=1,
++            index=safe_indices_exp,
++        )  # (chunk_rows, topk, hn)
++
++        q_f = q_chunk.float()
++        kv_g = kv_gathered.float()
++        scores = torch.einsum("inh,ikh->ink", q_f, kv_g) * softmax_scale
++        invalid_mask = (indices_chunk < 0).unsqueeze(1)
++        scores = scores.masked_fill(invalid_mask, float("-inf"))
++
++        scores_max = scores.max(dim=-1, keepdim=True).values
++        scores_max = torch.max(scores_max, sink)
++        exp_scores = torch.exp(scores - scores_max)
++        exp_sink = torch.exp(sink - scores_max)
++        attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
++        output_chunks.append(torch.einsum("ink,ikh->inh", attn_weights, kv_g).to(query.dtype))
+
+-    output = torch.einsum("ink,ikh->inh", attn_weights, kv_g)
+-    output = output.to(query.dtype)
++    output = output_chunks[0] if len(output_chunks) == 1 else torch.cat(output_chunks, dim=0)
+
+     # ----------- Layout-specific output reshape ---------------------------
+     if is_thd:
